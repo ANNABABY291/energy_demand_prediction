@@ -1,0 +1,437 @@
+# Chapter 4 Results Pipeline (M1–M4) — Ready-to-Run
+# What this script does:
+# - Loads your hourly energy + weather dataset (or generates a realistic synthetic one if none provided)
+# - Trains 4 models: M1 (Ridge baseline), M2 (LSTM load-only), M3 (LSTM + temporal), M4 (LSTM + env + temporal)
+# - Evaluates MAE, RMSE, MAPE, R2
+# - Runs a paired t-test (M1 vs M4) on absolute errors
+# - Produces subgroup analyses (temporal breakdowns + extreme weather)
+# - Computes permutation feature importance for M4
+# - Exports CSVs and figures into an output folder
+#
+# How to run:
+#   pip install numpy pandas scikit-learn scipy matplotlib "tensorflow>=2.11,<3"
+#   python chapter4_pipeline.py
+#
+# Optional: set DATA_CSV to your dataset path (must contain columns below). If None, synthetic data is generated.
+# Required columns if using real data (hourly resolution or finer):
+#   ['timestamp','load_kW','temperature','humidity','wind_speed','precipitation','is_holiday']
+
+import os
+import math
+import json
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from typing import Tuple, Dict, List
+
+# Reproducibility
+np.random.seed(42)
+
+
+DATA_CSV = "/content/hourly_energy_weather.csv"  # e.g., r"/path/to/hourly_energy_weather.csv" ; keep None to auto-generate synthetic data
+OUTPUT_DIR = Path("ch4_outputs")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Sequence/window length and forecast horizon
+SEQ_LEN = 24   # past 24 hours
+HORIZON = 1    # forecast next 1 hour
+
+# Train/val/test splits (chronological)
+TRAIN_FRAC, VAL_FRAC, TEST_FRAC = 0.70, 0.15, 0.15
+
+# LSTM hyperparameters
+LSTM_UNITS_1 = 64
+LSTM_UNITS_2 = 32
+DROPOUT = 0.2
+LR = 1e-3
+BATCH_SIZE = 64
+EPOCHS = 50
+PATIENCE = 10
+
+
+
+def ensure_datetime(df: pd.DataFrame, ts_col: str = "timestamp") -> pd.DataFrame:
+    df = df.copy()
+    df[ts_col] = pd.to_datetime(df[ts_col])
+    df = df.sort_values(ts_col).reset_index(drop=True)
+    return df
+
+def generate_synthetic_hourly(n_days: int = 365*2) -> pd.DataFrame:
+    """Generate synthetic hourly energy demand + weather for ~2 years."""
+    hours = n_days * 24
+    idx = pd.date_range("2019-01-01", periods=hours, freq="H")
+    # Base load with daily and weekly seasonality + noise
+    daily = 1.5 + 0.3*np.sin(2*np.pi*(idx.hour/24))
+    weekly = 0.1*np.sin(2*np.pi*(idx.dayofweek/7))
+    seasonal = 0.2*np.sin(2*np.pi*(idx.dayofyear/365.25))
+    noise = 0.05*np.random.randn(hours)
+    # Weather
+    temp = 12 + 8*np.sin(2*np.pi*(idx.dayofyear/365.25)) + 3*np.random.randn(hours)/3
+    humidity = 60 + 20*np.sin(2*np.pi*(idx.hour/24 + 0.25)) + 10*np.random.randn(hours)/5
+    wind = 3 + np.abs(1*np.sin(2*np.pi*idx.dayofyear/15)) + 0.5*np.random.randn(hours)
+    precip = np.clip(np.random.gamma(shape=0.8, scale=0.5, size=hours) - 0.2, 0, None)
+    # Demand influenced by temp/humidity (cooling/heating)
+    load = daily + weekly + seasonal + noise + 0.02*(20 - np.abs(temp - 20))*(-1) + 0.001*(humidity-50)
+    df = pd.DataFrame({
+        "timestamp": idx,
+        "load_kW": load.clip(0.2, None),
+        "temperature": temp,
+        "humidity": humidity.clip(20, 100),
+        "wind_speed": wind.clip(0, None),
+        "precipitation": precip,
+    })
+    # Weekend & a few holiday flags
+    holidays = set(pd.to_datetime([
+        "2019-01-01", "2019-03-17", "2019-12-25",
+        "2020-01-01", "2020-03-17", "2020-12-25"
+    ]).date)
+    df["is_holiday"] = ((df["timestamp"].dt.dayofweek >= 5) | (df["timestamp"].dt.date.isin(holidays))).astype(int)
+    return df
+
+def load_or_generate_data() -> pd.DataFrame:
+    if DATA_CSV and Path(DATA_CSV).exists():
+        df = pd.read_csv(DATA_CSV)
+        df = ensure_datetime(df, "timestamp")
+        # Ensure required columns exist
+        required = ["timestamp","load_kW","temperature","humidity","wind_speed","precipitation","is_holiday"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"Missing columns in {DATA_CSV}: {missing}")
+        # Aggregate to hourly if needed
+        if df["timestamp"].dt.freq is None:
+            df["timestamp_hour"] = df["timestamp"].dt.floor("H")
+            df = (df
+                  .groupby("timestamp_hour")[["load_kW","temperature","humidity","wind_speed","precipitation","is_holiday"]]
+                  .mean()
+                  .reset_index()
+                  .rename(columns={"timestamp_hour":"timestamp"}))
+    else:
+        df = generate_synthetic_hourly()
+    return df
+
+def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    hour = df["timestamp"].dt.hour
+    dow = df["timestamp"].dt.dayofweek
+    df["sin_hour"] = np.sin(2*np.pi*hour/24)
+    df["cos_hour"] = np.cos(2*np.pi*hour/24)
+    df["sin_dow"] = np.sin(2*np.pi*dow/7)
+    df["cos_dow"] = np.cos(2*np.pi*dow/7)
+    return df
+
+def train_val_test_split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    n = len(df)
+    n_train = int(n*TRAIN_FRAC)
+    n_val = int(n*VAL_FRAC)
+    train = df.iloc[:n_train]
+    val = df.iloc[n_train:n_train+n_val]
+    test = df.iloc[n_train+n_val:]
+    return train, val, test
+
+def make_lags(df: pd.DataFrame, target_col: str, max_lag: int) -> pd.DataFrame:
+    df = df.copy()
+    for lag in range(1, max_lag+1):
+        df[f"{target_col}_lag{lag}"] = df[target_col].shift(lag)
+    df = df.dropna().reset_index(drop=True)
+    return df
+
+# Metrics 
+def mae(y, yhat): return float(np.mean(np.abs(y - yhat)))
+def rmse(y, yhat): return float(np.sqrt(np.mean((y - yhat)**2)))
+def mape(y, yhat):
+    eps = 1e-8
+    return float(np.mean(np.abs((y - yhat) / (np.clip(np.abs(y), eps, None))))*100.0)
+def r2(y, yhat):
+    ss_res = np.sum((y - yhat)**2)
+    ss_tot = np.sum((y - np.mean(y))**2)
+    return float(1 - ss_res/ss_tot)
+
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import MinMaxScaler
+from scipy.stats import ttest_rel
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# TensorFlow / Keras
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks
+
+def build_lstm(input_shape: Tuple[int,int]) -> tf.keras.Model:
+    model = models.Sequential([
+        layers.Input(shape=input_shape),
+        layers.LSTM(LSTM_UNITS_1, return_sequences=True),
+        layers.Dropout(DROPOUT),
+        layers.LSTM(LSTM_UNITS_2),
+        layers.Dropout(DROPOUT),
+        layers.Dense(32, activation="relu"),
+        layers.Dense(1, activation="linear")
+    ])
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=LR),
+                  loss="mae")
+    return model
+
+def create_sequences(X: np.ndarray, y: np.ndarray, seq_len: int, horizon: int=1) -> Tuple[np.ndarray, np.ndarray]:
+    Xs, ys = [], []
+    for i in range(len(X) - seq_len - horizon + 1):
+        Xs.append(X[i:i+seq_len])
+        ys.append(y[i+seq_len+horizon-1])
+    return np.array(Xs), np.array(ys)
+
+def evaluate(y_true, y_pred) -> Dict[str,float]:
+    return {"MAE": mae(y_true, y_pred), "RMSE": rmse(y_true, y_pred),
+            "MAPE": mape(y_true, y_pred), "R2": r2(y_true, y_pred)}
+
+def permutation_importance_lstm(model: tf.keras.Model, X_seq: np.ndarray, y: np.ndarray, baseline_mae: float,
+                                feature_names: List[str], step: int = 200) -> pd.DataFrame:
+    """Permutation importance for sequence features (permute across samples, preserve time order)."""
+    n_samples, seq_len, n_features = X_seq.shape
+    idxs = np.arange(n_samples)
+    if n_samples > step:
+        idxs = np.random.choice(idxs, size=step, replace=False)
+    X_base = X_seq[idxs].copy()
+    y_base = y[idxs].copy()
+    results = []
+    for f in range(n_features):
+        X_perm = X_base.copy()
+        perm = np.random.permutation(len(idxs))
+        X_perm[:, :, f] = X_perm[perm, :, f]
+        y_hat_perm = model.predict(X_perm, verbose=0).ravel()
+        perm_mae = mae(y_base, y_hat_perm)
+        delta = (perm_mae - baseline_mae) / (baseline_mae + 1e-8)
+        results.append({"feature": feature_names[f], "relative_mae_increase": float(delta)})
+    return pd.DataFrame(results).sort_values("relative_mae_increase", ascending=False).reset_index(drop=True)
+
+def main():
+    # 1) Load data
+    df = load_or_generate_data()
+    df = ensure_datetime(df)
+    df = add_time_features(df)
+
+    # 2) Train/Val/Test split
+    train, val, test = train_val_test_split(df)
+
+    # 3) Baseline M1 (Ridge) with lagged features + is_holiday
+    m1_df = make_lags(df[["timestamp","load_kW","is_holiday"]].copy(), "load_kW", SEQ_LEN)
+    m1_train = m1_df[m1_df["timestamp"].between(train["timestamp"].min(), train["timestamp"].max())].copy()
+    m1_val   = m1_df[m1_df["timestamp"].between(val["timestamp"].min(), val["timestamp"].max())].copy()
+    m1_test  = m1_df[m1_df["timestamp"].between(test["timestamp"].min(), test["timestamp"].max())].copy()
+
+    lag_cols = [c for c in m1_df.columns if c.startswith("load_kW_lag")]
+    X_m1_train = m1_train[lag_cols + ["is_holiday"]].values
+    y_m1_train = m1_train["load_kW"].values
+    X_m1_val   = m1_val[lag_cols + ["is_holiday"]].values
+    y_m1_val   = m1_val["load_kW"].values
+    X_m1_test  = m1_test[lag_cols + ["is_holiday"]].values
+    y_m1_test  = m1_test["load_kW"].values
+
+    scaler_m1 = MinMaxScaler()
+    X_m1_train_s = scaler_m1.fit_transform(X_m1_train)
+    X_m1_val_s   = scaler_m1.transform(X_m1_val)
+    X_m1_test_s  = scaler_m1.transform(X_m1_test)
+
+    m1 = Ridge(alpha=0.1, random_state=42)
+    m1.fit(X_m1_train_s, y_m1_train)
+    yhat_m1 = m1.predict(X_m1_test_s)
+
+    metrics = []
+    m1_metrics = evaluate(y_m1_test, yhat_m1)
+    metrics.append({"Model":"M1 - Baseline Ridge","MAE":m1_metrics["MAE"],"RMSE":m1_metrics["RMSE"],
+                    "MAPE":m1_metrics["MAPE"],"R2":m1_metrics["R2"]})
+
+    # 4) LSTM pipelines (M2, M3, M4)
+    # Continuous features
+    cont_cols = ["load_kW","temperature","humidity","wind_speed","precipitation",
+                 "sin_hour","cos_hour","sin_dow","cos_dow"]
+    # Scale continuous on train only
+    scaler_all = MinMaxScaler()
+    train_cont = scaler_all.fit_transform(train[cont_cols])
+    val_cont   = scaler_all.transform(val[cont_cols])
+    test_cont  = scaler_all.transform(test[cont_cols])
+
+    # Rebuild frames with scaled cont + raw is_holiday
+    train_s = pd.DataFrame(train_cont, columns=cont_cols, index=train.index).assign(is_holiday=train["is_holiday"].values)
+    val_s   = pd.DataFrame(val_cont, columns=cont_cols, index=val.index).assign(is_holiday=val["is_holiday"].values)
+    test_s  = pd.DataFrame(test_cont, columns=cont_cols, index=test.index).assign(is_holiday=test["is_holiday"].values)
+
+    def create_seq_for(cols: List[str]):
+        X_tr, y_tr = create_sequences(train_s[cols].values, train["load_kW"].values, SEQ_LEN, HORIZON)
+        X_v,  y_v  = create_sequences(val_s[cols].values,   val["load_kW"].values,   SEQ_LEN, HORIZON)
+        X_te, y_te = create_sequences(test_s[cols].values,  test["load_kW"].values,  SEQ_LEN, HORIZON)
+        return X_tr, y_tr, X_v, y_v, X_te, y_te
+
+    cb = [
+        callbacks.EarlyStopping(monitor="val_loss", patience=PATIENCE, restore_best_weights=True),
+        callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, verbose=0)
+    ]
+
+    # M2: load only
+    cols_m2 = ["load_kW"]
+    X2_tr, y2_tr, X2_v, y2_v, X2_te, y2_te = create_seq_for(cols_m2)
+    m2 = build_lstm((SEQ_LEN, len(cols_m2)))
+    m2.fit(X2_tr, y2_tr, validation_data=(X2_v, y2_v), epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0, callbacks=cb)
+    yhat_m2 = m2.predict(X2_te, verbose=0).ravel()
+    m2_metrics = evaluate(y2_te, yhat_m2)
+    metrics.append({"Model":"M2 - LSTM (LoadOnly)","MAE":m2_metrics["MAE"],"RMSE":m2_metrics["RMSE"],
+                    "MAPE":m2_metrics["MAPE"],"R2":m2_metrics["R2"]})
+
+    # M3: + temporal
+    cols_m3 = ["load_kW","sin_hour","cos_hour","sin_dow","cos_dow","is_holiday"]
+    X3_tr, y3_tr, X3_v, y3_v, X3_te, y3_te = create_seq_for(cols_m3)
+    m3 = build_lstm((SEQ_LEN, len(cols_m3)))
+    m3.fit(X3_tr, y3_tr, validation_data=(X3_v, y3_v), epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0, callbacks=cb)
+    yhat_m3 = m3.predict(X3_te, verbose=0).ravel()
+    m3_metrics = evaluate(y3_te, yhat_m3)
+    metrics.append({"Model":"M3 - LSTM (+Temporal)","MAE":m3_metrics["MAE"],"RMSE":m3_metrics["RMSE"],
+                    "MAPE":m3_metrics["MAPE"],"R2":m3_metrics["R2"]})
+
+    # M4: + env + temporal
+    cols_m4 = ["load_kW","temperature","humidity","wind_speed","precipitation",
+               "sin_hour","cos_hour","sin_dow","cos_dow","is_holiday"]
+    X4_tr, y4_tr, X4_v, y4_v, X4_te, y4_te = create_seq_for(cols_m4)
+    m4 = build_lstm((SEQ_LEN, len(cols_m4)))
+    m4.fit(X4_tr, y4_tr, validation_data=(X4_v, y4_v), epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0, callbacks=cb)
+    yhat_m4 = m4.predict(X4_te, verbose=0).ravel()
+    m4_metrics = evaluate(y4_te, yhat_m4)
+    metrics.append({"Model":"M4 - LSTM (+Env+Temporal)","MAE":m4_metrics["MAE"],"RMSE":m4_metrics["RMSE"],
+                    "MAPE":m4_metrics["MAPE"],"R2":m4_metrics["R2"]})
+
+    metrics_df = pd.DataFrame(metrics)
+    metrics_df.to_csv(OUTPUT_DIR/"metrics.csv", index=False)
+
+    # Paired t-test (M1 vs M4) on abs errors (truncate to min length for pairing)
+    n_pair = min(len(y_m1_test), len(y4_te))
+    m1_abs_err = np.abs(y_m1_test[-n_pair:] - yhat_m1[-n_pair:])
+    m4_abs_err = np.abs(y4_te[-n_pair:] - yhat_m4[-n_pair:])
+    from scipy.stats import ttest_rel
+    t_stat, p_val = ttest_rel(m1_abs_err, m4_abs_err, alternative="greater")
+    stats = {"paired_t_stat": float(t_stat), "p_value": float(p_val)}
+    with open(OUTPUT_DIR/"stats.json","w") as f:
+        json.dump(stats, f, indent=2)
+
+    # Temporal breakdowns (align timestamps with sequence outputs)
+    def seq_timestamps(base_df: pd.DataFrame) -> pd.Series:
+        return base_df["timestamp"].iloc[SEQ_LEN+HORIZON-1:].reset_index(drop=True)
+
+    ts_test = seq_timestamps(test)
+    n_match = min(len(ts_test), len(y4_te), len(yhat_m4))
+    ts_test = ts_test[:n_match]
+    y4 = y4_te[:n_match]; y4_hat = yhat_m4[:n_match]
+    y1 = y_m1_test[-n_pair:][-n_match:]
+    y1_hat = yhat_m1[-n_pair:][-n_match:]
+
+    def subgroup_mae(y_true: np.ndarray, y_pred: np.ndarray, mask: np.ndarray) -> float:
+        if mask.sum() == 0:
+            return float("nan")
+        return mae(y_true[mask], y_pred[mask])
+
+    dow = ts_test.dt.dayofweek.values
+    hour = ts_test.dt.hour.values
+    weekday_mask = (dow < 5)
+    weekend_mask = (dow >= 5)
+    daytime_mask = (hour >= 6) & (hour < 22)
+    nighttime_mask = ~daytime_mask
+
+    temp_rows = []
+    temp_rows.append({"Condition":"Weekdays","M1_MAE": subgroup_mae(y1, y1_hat, weekday_mask),
+                      "M4_MAE": subgroup_mae(y4, y4_hat, weekday_mask)})
+    temp_rows.append({"Condition":"Weekends","M1_MAE": subgroup_mae(y1, y1_hat, weekend_mask),
+                      "M4_MAE": subgroup_mae(y4, y4_hat, weekend_mask)})
+    temp_rows.append({"Condition":"Daytime (06-22)","M1_MAE": subgroup_mae(y1, y1_hat, daytime_mask),
+                      "M4_MAE": subgroup_mae(y4, y4_hat, daytime_mask)})
+    temp_rows.append({"Condition":"Nighttime (22-06)","M1_MAE": subgroup_mae(y1, y1_hat, nighttime_mask),
+                      "M4_MAE": subgroup_mae(y4, y4_hat, nighttime_mask)})
+    temp_df = pd.DataFrame(temp_rows)
+    temp_df["Improvement_%"] = (temp_df["M1_MAE"] - temp_df["M4_MAE"]) / temp_df["M1_MAE"] * 100.0
+    temp_df.to_csv(OUTPUT_DIR/"temporal_breakdown.csv", index=False)
+
+    # Extreme weather breakdown
+    temp_series = test["temperature"].iloc[SEQ_LEN+HORIZON-1:][:n_match].reset_index(drop=True)
+    q_hot = temp_series.quantile(0.90)
+    q_cold = temp_series.quantile(0.10)
+    hot_mask = (temp_series >= q_hot).values
+    cold_mask = (temp_series <= q_cold).values
+
+    extreme_rows = []
+    extreme_rows.append({"Subset":"Hot Days","M1_MAE": subgroup_mae(y1, y1_hat, hot_mask),
+                         "M4_MAE": subgroup_mae(y4, y4_hat, hot_mask)})
+    extreme_rows.append({"Subset":"Cold Days","M1_MAE": subgroup_mae(y1, y1_hat, cold_mask),
+                         "M4_MAE": subgroup_mae(y4, y4_hat, cold_mask)})
+    extreme_df = pd.DataFrame(extreme_rows)
+    extreme_df["Improvement_%"] = (extreme_df["M1_MAE"] - extreme_df["M4_MAE"]) / extreme_df["M1_MAE"] * 100.0
+    extreme_df.to_csv(OUTPUT_DIR/"extreme_weather.csv", index=False)
+
+    # Permutation importance for M4
+    imp_df = permutation_importance_lstm(m4, X4_te, y4_te, baseline_mae=m4_metrics["MAE"],
+                                         feature_names=cols_m4, step=min(400, len(X4_te)))
+    imp_df.to_csv(OUTPUT_DIR/"feature_importance.csv", index=False)
+
+    # ---- Figures ----
+    labels = metrics_df["Model"].values
+    mae_vals = metrics_df["MAE"].values
+    rmse_vals = metrics_df["RMSE"].values
+
+    plt.figure(figsize=(9,5))
+    plt.bar(labels, mae_vals)
+    plt.ylabel("MAE (kW)")
+    plt.title("Model Performance Comparison (MAE)")
+    plt.xticks(rotation=20, ha="right")
+    for i, v in enumerate(mae_vals):
+        plt.text(i, v + 0.005, f"{v:.3f}", ha="center", va="bottom")
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR/"mae_comparison.png", dpi=200)
+    plt.close()
+
+    plt.figure(figsize=(9,5))
+    plt.bar(labels, rmse_vals)
+    plt.ylabel("RMSE (kW)")
+    plt.title("Model Performance Comparison (RMSE)")
+    plt.xticks(rotation=20, ha="right")
+    for i, v in enumerate(rmse_vals):
+        plt.text(i, v + 0.005, f"{v:.3f}", ha="center", va="bottom")
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR/"rmse_comparison.png", dpi=200)
+    plt.close()
+
+    # Feature importance (top 10)
+    top_imp = imp_df.head(10).copy()
+    plt.figure(figsize=(8,5))
+    plt.barh(top_imp["feature"][::-1], top_imp["relative_mae_increase"][::-1])
+    plt.xlabel("Relative MAE Increase (permute feature)")
+    plt.title("Permutation Feature Importance (M4)")
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR/"feature_importance.png", dpi=200)
+    plt.close()
+
+    # Prediction vs Actual (M1 vs M4) on a 72-hour window
+    window = min(72, len(y4))
+    x_axis = np.arange(window)
+    plt.figure(figsize=(10,5))
+    plt.plot(x_axis, y4[:window], label="Actual")
+    plt.plot(x_axis, y4_hat[:window], label="M4 Pred", linestyle="--")
+    plt.plot(x_axis, y1_hat[:window], label="M1 Pred", linestyle=":")
+    plt.xlabel("Hour (sample window)")
+    plt.ylabel("Energy Demand (kW)")
+    plt.title("Prediction vs Actual (Sample 72-hour Window)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR/"prediction_vs_actual.png", dpi=200)
+    plt.close()
+
+    # Human-readable summary
+    summary = {
+        "metrics": metrics_df.to_dict(orient="records"),
+        "stats": stats,
+        "temporal_breakdown": temp_df.to_dict(orient="records"),
+        "extreme_weather": extreme_df.to_dict(orient="records"),
+        "outputs_dir": str(OUTPUT_DIR.resolve())
+    }
+    with open(OUTPUT_DIR/"summary.json","w") as f:
+        json.dump(summary, f, indent=2)
+
+    print("Done. Outputs saved to:", OUTPUT_DIR.resolve())
+
+if __name__ == "__main__":
+    main()
+
